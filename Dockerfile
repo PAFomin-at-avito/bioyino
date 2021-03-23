@@ -1,10 +1,10 @@
 FROM rust:latest as builder
 
 WORKDIR /usr/src/bioyino
-COPY . .
 
 RUN apt-get update && apt-get install capnproto -y
 
+COPY . .
 RUN cargo build --release
 
 FROM debian:stretch

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures3::channel::mpsc::{self, Sender, UnboundedSender};
 use futures3::{SinkExt, StreamExt, TryFutureExt};
 use tokio2::spawn;
 
-use rayon::{iter::IntoParallelIterator, iter::ParallelIterator, ThreadPoolBuilder};
+use rayon::{iter::IntoParallelIterator, iter::ParallelIterator, ThreadPoolBuilder, scope};
 use serde_derive::{Deserialize, Serialize};
 use slog::{info, warn, Logger};
 
@@ -168,7 +168,7 @@ impl Aggregator {
             tx,
             log,
         } = self;
-        let (task_tx, mut task_rx) = mpsc::unbounded();
+        let (task_tx, task_rx) = mpsc::unbounded();
 
         let response_chan = if is_leader {
             Some(task_tx)
@@ -198,16 +198,43 @@ impl Aggregator {
             return;
         }
 
-        // from now we consider us being a leader
+        // from now we assume us being a leader
 
-        let mut cache: HashMap<MetricName, Vec<Metric<Float>>> = HashMap::new();
-        while let Some(metrics) = task_rx.next().await {
-            //     #[allow(clippy::map_entry)] // clippy offers us the entry API here, but it doesn't work without additional cloning
-            for (name, metric) in metrics {
-                let entry = cache.entry(name).or_default();
-                entry.push(metric);
-            }
-        }
+        let cache: RwLock<HashMap<
+            MetricName,
+            Mutex<Vec<Metric<Float>>>
+        >> = RwLock::new(HashMap::new());
+
+        let pool = ThreadPoolBuilder::new()
+            .thread_name(|i| format!("bioyino_agg{}", i))
+            .num_threads(options.multi_threads)
+            .build()
+            .unwrap();
+
+        pool.install(|| {
+            scope(|s| {
+                let mut task_stream = futures3::executor::block_on_stream(task_rx);
+                while let Some(metrics) = task_stream.next() {
+                    // received part of metric cache
+                    s.spawn(|_| {
+                        // collect the received part into the aggregation cache
+                        for (name, metric) in metrics {
+                            let cache_read = cache.read().unwrap();
+                            match cache_read.get(&name) {
+                                Some(value) => {
+                                    value.lock().unwrap().push(metric);
+                                }
+                                None => {
+                                    drop(cache_read);
+                                    cache.write().unwrap().insert(name, Mutex::new(vec![metric]));
+                                }
+                            }
+                        }
+                    })
+                }
+            });
+        });
+        let cache = cache.into_inner().unwrap();
 
         info!(log, "leader aggregating metrics"; "amount"=>format!("{}", cache.len()));
 
@@ -218,7 +245,7 @@ impl Aggregator {
                     .map(move |(name, metrics)| {
                         let task_data = AggregationData {
                             name,
-                            metrics,
+                            metrics: metrics.into_inner().unwrap(),
                             options: options.clone(),
                             response: tx.clone(),
                         };
@@ -233,7 +260,7 @@ impl Aggregator {
                     .map(move |(num, (name, metrics))| {
                         let task_data = AggregationData {
                             name,
-                            metrics,
+                            metrics: metrics.into_inner().unwrap(),
                             options: options.clone(),
                             response: tx.clone(),
                         };
@@ -243,16 +270,11 @@ impl Aggregator {
                     .last();
             }
             AggregationMode::Separate => {
-                let pool = ThreadPoolBuilder::new()
-                    .thread_name(|i| format!("bioyino_agg{}", i))
-                    .num_threads(options.multi_threads)
-                    .build()
-                    .unwrap();
                 pool.install(|| {
                     cache.into_par_iter().for_each(move |(name, metrics)| {
                         let task_data = AggregationData {
                             name,
-                            metrics,
+                            metrics: metrics.into_inner().unwrap(),
                             options: options.clone(),
                             response: tx.clone(),
                         };
@@ -370,8 +392,9 @@ mod tests {
         chans.push(tx);
 
         let mut runtime = Builder::new()
+            .threaded_scheduler()
+            .core_threads(4)
             .thread_name("bio_agg_test")
-            .basic_scheduler()
             .enable_all()
             .build()
             .expect("creating runtime for test");
